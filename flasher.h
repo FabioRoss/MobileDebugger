@@ -18,6 +18,7 @@
 #define CMD_FLASH_END   0x04
 #define CMD_SYNC        0x08
 #define CMD_READ_REG    0x0A
+#define CMD_SPI_SET_PARAMS 0x0B
 #define CMD_SPI_ATTACH  0x0D
 #define CMD_CHANGE_BAUD 0x0F
 #define CMD_SPI_FLASH_MD5 0x13
@@ -41,6 +42,13 @@ volatile int      fl_pct   = 0;
 volatile uint32_t fl_done  = 0, fl_total = 0;
 volatile bool     fl_abort = false;
 char              fl_chip[24] = "?";
+
+/* Length of the status trailer the ROM appends to every reply: 2 bytes on the
+ * original ESP32/ESP8266, 4 on the ESP32-S2/S3/C3/C6. Getting this wrong makes
+ * fl_cmd read a reserved (always-zero) byte as the status, so every command —
+ * including a rejected flash_begin — looks like a success. Default to 4 (the
+ * S-series / assumed target); fl_detect_chip narrows it once the chip is known. */
+int               fl_status_len = 4;
 
 /* ---- one-slot log mailbox (task -> UI thread) ---- */
 volatile bool fl_mail_ready = false;
@@ -177,7 +185,9 @@ static bool fl_cmd(uint8_t cmd, const uint8_t *data, uint16_t len, uint32_t chk,
             if (val) *val = rb[4] | (rb[5] << 8) | (rb[6] << 16) | ((uint32_t)rb[7] << 24);
             if (8 + (int)size > rl) size = (rl >= 8) ? rl - 8 : 0;
             if (payload && plen) { *plen = size; if (size) memcpy(payload, rb + 8, size); }
-            uint8_t status = (size >= 2) ? rb[8 + size - 2] : 0;
+            /* The status byte is the first of the trailer at the END of the data
+             * section; any command payload (e.g. an MD5 digest) sits before it. */
+            uint8_t status = ((int)size >= fl_status_len) ? rb[8 + size - fl_status_len] : 0;
             return status == 0;
         }
     }
@@ -263,17 +273,22 @@ static bool fl_sync() {
 static void fl_detect_chip(bool *append_encrypt, bool *need_attach) {
     *append_encrypt = true;   /* default: treat as S3-like */
     *need_attach    = true;
+    fl_status_len   = 4;      /* S2/S3/C-series reply with a 4-byte status trailer */
     uint32_t magic = 0;
     uint8_t d[4]; put32(d, CHIP_MAGIC_REG);
-    if (!fl_cmd(CMD_READ_REG, d, 4, 0, 500, &magic)) { strcpy(fl_chip, "ESP (assumed S3)"); return; }
+    /* The magic word is copied into `magic` as soon as a reply frame arrives,
+     * regardless of the (chip-dependent) status byte we can't trust yet — so we
+     * read it whether or not fl_cmd reports success. magic stays 0 on no reply. */
+    fl_cmd(CMD_READ_REG, d, 4, 0, 500, &magic);
     switch (magic) {
-        case 0x00f01d83: strcpy(fl_chip, "ESP32");    *append_encrypt = false; break;
+        case 0x00f01d83: strcpy(fl_chip, "ESP32");    *append_encrypt = false; fl_status_len = 2; break;
         case 0x000007c6: strcpy(fl_chip, "ESP32-S2"); break;
         case 0x00000009: strcpy(fl_chip, "ESP32-S3"); break;
         case 0x6921506f: case 0x1b31506f: case 0x4881606f:
         case 0x4361606f: strcpy(fl_chip, "ESP32-C3"); break;
         case 0x2ce0806f: strcpy(fl_chip, "ESP32-C6"); break;
-        case 0xfff0c101: strcpy(fl_chip, "ESP8266"); *append_encrypt = false; *need_attach = false; break;
+        case 0xfff0c101: strcpy(fl_chip, "ESP8266"); *append_encrypt = false; *need_attach = false; fl_status_len = 2; break;
+        case 0:          strcpy(fl_chip, "ESP (assumed S3)"); break;   /* no reply to READ_REG */
         default: snprintf(fl_chip, sizeof(fl_chip), "unknown %08lX", (unsigned long)magic); break;
     }
 }
@@ -327,7 +342,7 @@ static bool fl_flash_part(File &f, uint32_t offset, uint32_t size, bool append_e
         if (!fl_cmd(CMD_SPI_FLASH_MD5, m, 16, 0, to_md5, &val, resp, &rlen)) {
             fl_log("MD5 read failed (flash OK, unverified)", SEV_WARN);
         } else {
-            int dig = rlen - 2;                  /* strip 2 status bytes */
+            int dig = rlen - fl_status_len;       /* strip the status trailer (2 or 4) */
             bool match = false;
             if (dig == 32) {                     /* hex string form (ROM) */
                 char hh[33];
@@ -379,11 +394,41 @@ static void fl_run() {
         }
     }
 
-    /* total size across all parts, for the progress bar */
+    /* total size across all parts (progress bar) and the highest byte we touch */
     fl_total = 0;
+    uint32_t fl_extent = 0;
     for (int i = 0; i < fl_nparts; i++) {
         File f = SD.open(fl_parts[i].path);
-        if (f) { fl_total += f.size(); f.close(); }
+        if (f) {
+            uint32_t sz = f.size();
+            fl_total += sz;
+            if (fl_parts[i].offset + sz > fl_extent) fl_extent = fl_parts[i].offset + sz;
+            f.close();
+        }
+    }
+
+    /* Tell the ROM how big the target flash is. Left unset, the loader keeps its
+     * power-on default size and rejects any FLASH_BEGIN whose erase runs past it
+     * (e.g. a full 4 MB image) — the erase fails, every following write is
+     * silently dropped, and the target keeps its old firmware. Round the region
+     * we actually touch up to a power of two (min 1 MB) for the size argument. */
+    {
+        uint32_t fsz = 0x100000;
+        while (fsz < fl_extent) fsz <<= 1;
+        uint8_t p[24];
+        put32(p,      0);            /* flash id (unused) */
+        put32(p + 4,  fsz);          /* total size        */
+        put32(p + 8,  0x10000);      /* block  64 KB      */
+        put32(p + 12, 0x1000);       /* sector  4 KB      */
+        put32(p + 16, 0x100);        /* page   256 B      */
+        put32(p + 20, 0xFFFF);       /* status mask       */
+        if (fl_cmd(CMD_SPI_SET_PARAMS, p, 24, 0, 3000)) {
+            char m[48]; snprintf(m, sizeof(m), "target flash size -> %lu KB",
+                                 (unsigned long)(fsz / 1024));
+            fl_log(m, SEV_SYS);
+        } else {
+            fl_log("set-flash-params rejected (continuing)", SEV_WARN);
+        }
     }
 
     bool ok = true;
