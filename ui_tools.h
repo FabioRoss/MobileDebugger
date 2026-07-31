@@ -303,8 +303,9 @@ static void build_tools_screen() {
     lv_obj_t *t_test  = lv_tabview_add_tab(tv_tools, "DISP");
     lv_obj_t *t_i2c   = lv_tabview_add_tab(tv_tools, "I2C");
     lv_obj_t *t_gpio  = lv_tabview_add_tab(tv_tools, "GPIO");
-    lv_obj_t *pages[] = { t_uart, t_flash, t_macro, t_sys, t_test, t_i2c, t_gpio };
-    for (int i = 0; i < 7; i++) {
+    lv_obj_t *t_fleet = lv_tabview_add_tab(tv_tools, "FLEET");
+    lv_obj_t *pages[] = { t_uart, t_flash, t_macro, t_sys, t_test, t_i2c, t_gpio, t_fleet };
+    for (int i = 0; i < 8; i++) {
         lv_obj_set_style_pad_all(pages[i], 0, 0);
         lv_obj_set_style_bg_color(pages[i], COL_BG, 0);
         lv_obj_set_style_bg_opa(pages[i], LV_OPA_COVER, 0);
@@ -353,6 +354,9 @@ static void build_tools_screen() {
 
     /* ---------------- FLASH tab ---------------- */
     flash_build_tab(t_flash);
+
+    /* ---------------- FLEET tab ---------------- */
+    fleet_build_tab(t_fleet);
 
     /* ---------------- SYS tab ---------------- */
     lbl_sysinfo = mk_lbl(t_sys, 6, 2, "", FONT_S, COL_TEXT);

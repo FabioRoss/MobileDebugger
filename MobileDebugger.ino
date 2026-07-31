@@ -65,9 +65,14 @@
 
 /* --- pins that drive the TARGET board being flashed --------------------- *
  * Wire these two to the target's IO0(BOOT) and EN(RST). Any free GPIO on
- * this board works — 5/6/7/9/14/15/16/46 are broken out and unused. */
-#define TGT_IO0         5           /* -> target IO0 / BOOT  */
-#define TGT_EN          6           /* -> target EN  / RST   */
+ * this board works — 5/6/7/9/14/15/16/46 are broken out and unused.
+ *
+ * Moved from 5/6 to 15/16 so the LoRa module can use the RaceBoard's exact
+ * pin map (SS=5, RST=6, SCK=7, MOSI=9, MISO=14) and one wiring harness
+ * serves both devices. If you have an older harness, re-seat these two
+ * jumpers. See fleet_ota.h. */
+#define TGT_IO0         15          /* -> target IO0 / BOOT  */
+#define TGT_EN          16          /* -> target EN  / RST   */
 /* UART to the target reuses UART1: our RX(GPIO17) <- target TX,
  * our TX(GPIO18) -> target RX. Plus a common GND. 3.3V logic only. */
 
@@ -118,8 +123,11 @@ void tools_set_autobaud_status(const char *s);
 #include "diag.h"
 #include "sdcard.h"
 #include "flasher.h"
+#include "ota_protocol.h"
+#include "fleet_ota.h"
 #include "ui_common.h"
 #include "ui_flash.h"
+#include "ui_fleet.h"
 #include "ui_monitor.h"
 #include "ui_tools.h"
 
