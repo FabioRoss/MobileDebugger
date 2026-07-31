@@ -217,6 +217,16 @@ static void fo_tick(lv_timer_t *t) {
     else          snprintf(b, sizeof(b), "%s %d%%  %d ready  %d ok", st, fo_pct, ready, ok);
     lv_label_set_text(fo_lbl_stat, b);
 
+    /* Once the image is parsed, show what it actually is rather than what the
+     * filename claims - the last chance to catch a wrong .bin before it goes
+     * out to the whole fleet. */
+    if (fo_proj[0]) {
+        char s[180];
+        const char *nm = strrchr(fo_path, '/'); nm = nm ? nm + 1 : fo_path;
+        snprintf(s, sizeof(s), "%s  ->  %s v%s", nm, fo_proj, fo_version);
+        lv_label_set_text(fo_lbl_sel, s);
+    }
+
     lv_obj_set_style_bg_color(fo_bar,
         fo_state == FO_ERR ? COL_RED : (fo_state == FO_DONE ? COL_GREEN : COL_CYAN),
         LV_PART_INDICATOR);

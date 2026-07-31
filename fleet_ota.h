@@ -57,6 +57,7 @@ volatile bool     fo_running = false;
 
 char     fo_path[160]   = "";
 char     fo_version[OTA_VERSION_LEN + 1] = "";
+char     fo_proj[33]    = "";   /* project name read out of the app descriptor */
 
 /* ---- the image, staged in PSRAM --------------------------------------- */
 static uint8_t  *fo_image   = nullptr;
@@ -320,6 +321,40 @@ static bool fo_loadImage() {
     if (fo_image[0] != 0xE9) {
         fo_log("not an ESP app image (first byte != 0xE9)", SEV_ERR);
         return false;
+    }
+
+    /* A merged bootstrap image ALSO starts 0xE9 - that is the bootloader at
+     * offset 0. OTA writes a bare app into ota_0, so sending the merged file
+     * would be wrong. Tell them apart by the partition-table magic that only
+     * a full-flash image carries at 0x8000. */
+    if (fo_size > 0x8002 && fo_image[0x8000] == 0xAA && fo_image[0x8001] == 0x50) {
+        fo_log("this is a MERGED full-flash image - OTA needs the bare app .bin",
+               SEV_ERR);
+        return false;
+    }
+
+    /* esp_app_desc_t sits at 0x20 in every app image (right after the 24-byte
+     * image header and the 8-byte first segment header). It carries the real
+     * project name and version, so the operator can confirm they picked the
+     * right firmware instead of trusting the filename. */
+    fo_proj[0] = 0;
+    if (fo_size > 0x70) {
+        uint32_t desc_magic;
+        memcpy(&desc_magic, fo_image + 0x20, 4);
+        if (desc_magic == 0xABCD5432) {
+            char v[33] = {0}, pn[33] = {0};
+            memcpy(v,  fo_image + 0x30, 32);
+            memcpy(pn, fo_image + 0x50, 32);
+            v[32] = pn[32] = 0;
+            strncpy(fo_proj, pn, sizeof(fo_proj) - 1);
+            if (v[0]) {          /* prefer the embedded version to the filename */
+                strncpy(fo_version, v, OTA_VERSION_LEN);
+                fo_version[OTA_VERSION_LEN] = 0;
+            }
+            fo_logf(SEV_INFO, "image: project '%s' version '%s'", pn, v);
+        } else {
+            fo_log("no app descriptor - check this is the right .bin", SEV_WARN);
+        }
     }
 
     mbedtls_sha256_context c;
