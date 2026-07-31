@@ -71,8 +71,8 @@
  * pin map (SS=5, RST=6, SCK=7, MOSI=9, MISO=14) and one wiring harness
  * serves both devices. If you have an older harness, re-seat these two
  * jumpers. See fleet_ota.h. */
-#define TGT_IO0         15          /* -> target IO0 / BOOT  */
-#define TGT_EN          16          /* -> target EN  / RST   */
+#define TGT_IO0         -1          /* -> target IO0 / BOOT  */
+#define TGT_EN          -1          /* -> target EN  / RST   */
 /* UART to the target reuses UART1: our RX(GPIO17) <- target TX,
  * our TX(GPIO18) -> target RX. Plus a common GND. 3.3V logic only. */
 
