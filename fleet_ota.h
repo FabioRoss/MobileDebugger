@@ -274,6 +274,14 @@ void fleet_lora_poll() {
         memcpy(fo_nodes[n].version, h->version, OTA_VERSION_LEN);
         fo_nodes[n].version[OTA_VERSION_LEN] = 0;
         if (h->state == OTA_STATE_OK) fo_nodes[n].complete = true;
+        fo_logf(SEV_OK, "board %02X%02X%02X: %s state=%u v%s",
+                h->mac[3], h->mac[4], h->mac[5],
+                buf[1] == OTA_LORA_RESULT ? "RESULT" : "HELLO",
+                h->state, fo_nodes[n].version);
+    } else if (len >= 2) {
+        /* Something arrived with our magic but was not a board reply. Worth
+         * seeing while bringing the link up. */
+        fo_logf(SEV_WARN, "LoRa: unexpected OTA type 0x%02x len %u", buf[1], len);
     }
 }
 

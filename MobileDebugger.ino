@@ -164,6 +164,16 @@ void setup() {
 
 void loop() {
     uart_poll();
+
+    /* Poll the LoRa radio every iteration, NOT from a UI timer.
+     * sandeepmistry's parsePacket() leaves the SX1276 in RX_SINGLE, which
+     * times out after REG_SYMB_TIMEOUT symbols (~100 ms at SF7/BW125) and
+     * drops to standby until the next call. Polling at the old 400 ms UI-timer
+     * rate left the radio deaf about three quarters of the time, so board
+     * replies to a ROLLCALL were routinely missed.
+     * Skipped while a fleet job owns the radio - that task polls it itself. */
+    if (!fo_running) fleet_lora_poll();
+
     lv_timer_periodic_handler();
     delay(2);
 }

@@ -191,8 +191,8 @@ static void fo_tick(lv_timer_t *t) {
     (void)t;
     if (fo_mail_ready) { log_push(fo_mail, fo_mail_sev); fo_mail_ready = false; }
 
-    /* Drain inbound LoRa while idle. During a job the task owns the radio. */
-    if (!fo_running) fleet_lora_poll();
+    /* LoRa is drained from loop() at full rate - see the note there. Polling
+     * it from this 400 ms timer is what made ROLLCALL replies go missing. */
 
     if (!fo_bar) return;
     lv_bar_set_value(fo_bar, fo_pct, LV_ANIM_OFF);
