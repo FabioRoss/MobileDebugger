@@ -25,15 +25,22 @@
 #include <esp_random.h>
 #include <mbedtls/sha256.h>
 #include <SPI.h>
-#include <LoRa.h>
+#include "src/wr_lora/WRLoRa.h"
 #include <CRC32.h>
 #include <stdarg.h>
 
 #include "ota_protocol.h"
 
 /* ---- LoRa pins. Identical to the RaceBoard's map (LoRaProtocol.h) so one
- *      wiring harness serves both. That is why TGT_IO0/TGT_EN moved to 15/16
- *      in MobileDebugger.ino — they used to sit on 5 and 6. ---------------- */
+ *      wiring harness serves both.
+ *
+ *      The radio is BIT-BANGED (src/wr_lora), not on a hardware SPI
+ *      peripheral, for the same reason as the RaceBoard: this board has only
+ *      SPI3 free (the QSPI display owns SPI2 permanently) and the SD card
+ *      needs it. Both sdcard.h's `SPIClass sdSPI` and the old
+ *      `SPIClass fo_loraSPI` defaulted to HSPI == SPI3_HOST, so mounting the
+ *      card and starting the radio reset the peripheral out from under each
+ *      other — which broke fo_loadImage() during a fleet flash. ------------ */
 #define FO_LORA_BAND  433E6
 #define FO_LORA_SCK    7
 #define FO_LORA_MISO  14
@@ -91,7 +98,6 @@ static uint8_t  *fo_need = nullptr;
 static uint32_t  fo_needBytes = 0;
 
 static const uint8_t fo_bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-static SPIClass fo_loraSPI;
 static bool     fo_loraUp = false;
 
 /* ---- one-slot log mailbox (job task -> UI), same idiom as flasher.h ---- */
@@ -226,12 +232,12 @@ static bool fo_nowStart() {
 
 bool fleet_lora_begin() {
     if (fo_loraUp) return true;
-    fo_loraSPI.begin(FO_LORA_SCK, FO_LORA_MISO, FO_LORA_MOSI, FO_LORA_SS);
-    LoRa.setPins(FO_LORA_SS, FO_LORA_RST, FO_LORA_DIO0);
-    LoRa.setSPI(fo_loraSPI);
-    LoRa.setSPIFrequency(10000000);
-    if (!LoRa.begin(FO_LORA_BAND)) { fo_loraSPI.end(); fo_loraUp = false; return false; }
+    WRLoRa.setPins(FO_LORA_SS, FO_LORA_RST, FO_LORA_DIO0);
+    WRLoRa.setSPIPins(FO_LORA_SCK, FO_LORA_MISO, FO_LORA_MOSI);
+    if (!WRLoRa.begin(FO_LORA_BAND)) { fo_loraUp = false; return false; }
     fo_loraUp = true;
+    Serial.printf("[FLEET] LoRa up (soft SPI %lu Hz), SD keeps SPI3\n",
+                  (unsigned long)WRLoRa.spiBenchmarkHz());
     return true;
 }
 
@@ -239,25 +245,25 @@ static void fo_loraSend(const void *payload, uint8_t len) {
     if (!fo_loraUp) return;
     CRC32 crc; crc.update((uint8_t *)payload, len);
     uint32_t c = crc.finalize();
-    LoRa.beginPacket();
-    LoRa.write(len);
-    LoRa.write((const uint8_t *)payload, len);
-    LoRa.write((uint8_t *)&c, sizeof(c));
-    LoRa.endPacket();
+    WRLoRa.beginPacket();
+    WRLoRa.write(len);
+    WRLoRa.write((const uint8_t *)payload, len);
+    WRLoRa.write((uint8_t *)&c, sizeof(c));
+    WRLoRa.endPacket();
 }
 
-/* Drain any inbound LoRa. Boards reply to roll-calls and report results here.
+/* Drain any inbound WRLoRa. Boards reply to roll-calls and report results here.
  * Safe to call from the job task or, when idle, from the UI timer. */
 void fleet_lora_poll() {
     if (!fo_loraUp) return;
-    int ps = LoRa.parsePacket();
+    int ps = WRLoRa.parsePacket();
     if (!ps) return;
-    uint8_t len = LoRa.read();
-    if (ps != 1 + (int)len + 4) { while (LoRa.available()) LoRa.read(); return; }
+    uint8_t len = WRLoRa.read();
+    if (ps != 1 + (int)len + 4) { while (WRLoRa.available()) WRLoRa.read(); return; }
 
     uint8_t buf[255];
-    LoRa.readBytes(buf, len);
-    uint32_t rxCrc; LoRa.readBytes((uint8_t *)&rxCrc, sizeof(rxCrc));
+    WRLoRa.readBytes(buf, len);
+    uint32_t rxCrc; WRLoRa.readBytes((uint8_t *)&rxCrc, sizeof(rxCrc));
     CRC32 crc; crc.update(buf, len);
     if (crc.finalize() != rxCrc) return;
     if (len < 2 || buf[0] != OTA_LORA_MAGIC) return;
@@ -622,5 +628,9 @@ bool fleet_begin() {
 
 void fleet_start() {
     if (fo_running) return;
+    /* Set BEFORE the task exists. loop() skips fleet_lora_poll() while this is
+     * true; if the task set it itself there would be a window where core 1
+     * polls the radio while core 0 is already transmitting on it. */
+    fo_running = true;
     xTaskCreatePinnedToCore(fo_task, "fleet_ota", 8192, nullptr, 2, nullptr, 0);
 }
