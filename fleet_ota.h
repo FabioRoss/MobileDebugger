@@ -379,12 +379,8 @@ void fleet_lora_poll() {
  * the low byte of each MAC, so twenty boards do not collide. */
 void fleet_rollcall() {
     uint8_t p[3] = { OTA_LORA_MAGIC, OTA_LORA_ROLLCALL, OTA_PROTO_VERSION };
-    uint8_t t[5] = {0, 1, 2, 0, 0};
-    fo_loraSend(t, 5);
-    Serial.printf("Sent LoRa Packet: %02x %02x %02x %02x %02x\n", t[0], t[1], t[2], t[3], t[4]);
     fo_loraSend(p, sizeof(p));
     Serial.printf("Sent LoRa Packet: %02x %02x %02x\n", p[0], p[1], p[2]);
-
 }
 
 void fleet_abort_broadcast() {
