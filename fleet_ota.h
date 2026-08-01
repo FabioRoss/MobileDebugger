@@ -115,8 +115,17 @@ static volatile uint32_t fo_txPending = 0;   /* queued, not yet reported sent */
 static volatile uint32_t fo_txDropped = 0;   /* refused by esp_now_send()     */
 static volatile uint32_t fo_txFailed  = 0;   /* sent, but reported failure    */
 
-static void fo_onSent(const uint8_t *mac, esp_now_send_status_t status) {
-    (void)mac;
+/* The first parameter of esp_now_send_cb_t changed from `const uint8_t *mac`
+ * to `const wifi_tx_info_t *` in ESP-IDF 5.5 (Arduino core 3.3). Rather than
+ * pin a version number, derive the type from the typedef the installed core
+ * actually declares - this then compiles on both, and on whatever comes next.
+ * We ignore the argument either way. */
+template <typename Fn> struct FoFirstArg;
+template <typename R, typename A, typename... Rest>
+struct FoFirstArg<R (*)(A, Rest...)> { using type = A; };
+
+static void fo_onSent(typename FoFirstArg<esp_now_send_cb_t>::type,
+                      esp_now_send_status_t status) {
     if (fo_txPending) fo_txPending--;
     if (status != ESP_NOW_SEND_SUCCESS) fo_txFailed++;
 }
