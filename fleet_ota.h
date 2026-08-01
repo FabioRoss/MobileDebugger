@@ -584,6 +584,11 @@ static void fo_task(void *arg) {
     fo_round   = 0;
     fo_session = (uint32_t)esp_random();
 
+    /* Declared here, not down at the repair loop where it is used: the two
+     * `goto done` exits below would otherwise jump over its initialisation,
+     * which C++ rejects. */
+    int silentRounds = 0;
+
     /* ---- load + hash ---- */
     fo_state = FO_LOADING;
     fo_log("loading image from SD", SEV_SYS);
@@ -637,7 +642,6 @@ static void fo_task(void *arg) {
     fo_sendAll();
 
     /* ---- repair rounds ---- */
-    int silentRounds = 0;
     for (fo_round = 1; fo_round <= FO_MAX_ROUNDS && !fo_abort; fo_round++) {
         fo_state = FO_REPAIR;
         memset(fo_need, 0, fo_needBytes);
