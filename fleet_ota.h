@@ -87,7 +87,13 @@ struct FleetNode {
      * poll. Owned by the job task; the callback only fills bmpRx. */
     uint8_t *missing;
     uint32_t missingBytes;
-    volatile bool bmpFresh;
+    volatile bool     bmpFresh;
+    /* Which bitmap slices have arrived this poll. Keying completion off the
+     * last slice alone threw away four good slices out of five whenever the
+     * fifth was lost - and with two boards beaconing at each other, losing one
+     * is routine. */
+    volatile uint32_t bmpSliceMask;
+    uint8_t           bmpSliceCount;
 };
 
 static FleetNode fo_nodes[FO_MAX_NODES];
@@ -110,6 +116,12 @@ static bool     fo_loraUp = false;
  * The send callback is the only honest signal that a frame has left, so keep
  * a small window of in-flight frames and wait when it is full. */
 #define FO_TX_WINDOW 4
+
+/* Repair-round budget. More rounds than before because a round can now be a
+ * no-op retry rather than a guaranteed resend. */
+#define FO_MAX_ROUNDS         16
+#define FO_MAX_SILENT_ROUNDS   4
+#define FO_POLL_ATTEMPTS       3
 
 static volatile uint32_t fo_txPending = 0;   /* queued, not yet reported sent */
 static volatile uint32_t fo_txDropped = 0;   /* refused by esp_now_send()     */
@@ -245,8 +257,15 @@ static void fo_onRecv(const uint8_t *mac, const uint8_t *data, int len) {
             uint32_t cnt = nd.missingBytes - off;
             if (cnt > OTA_BITMAP_SLICE) cnt = OTA_BITMAP_SLICE;
             memcpy(nd.missing + off, b->bits, cnt);
-            /* last slice of the set — the job task can act on it now */
-            if (off + cnt >= nd.missingBytes) nd.bmpFresh = true;
+
+            const uint32_t slice = off / OTA_BITMAP_SLICE;
+            if (slice < 32) nd.bmpSliceMask |= (1u << slice);
+            /* Complete only when every slice has landed, in any order. */
+            const uint32_t full = (nd.bmpSliceCount >= 32)
+                                  ? 0xFFFFFFFFu
+                                  : ((1u << nd.bmpSliceCount) - 1u);
+            if (nd.bmpSliceCount && nd.bmpSliceMask == full)
+                nd.bmpFresh = true;
             break;
         }
         default: break;
@@ -513,16 +532,25 @@ static bool fo_pollNode(int n) {
         if (!nd.missing) return false;
         nd.missingBytes = fo_needBytes;
     }
-    memset(nd.missing, 0, nd.missingBytes);
-    nd.bmpFresh = false;
+    nd.bmpSliceCount = (uint8_t)((nd.missingBytes + OTA_BITMAP_SLICE - 1)
+                                 / OTA_BITMAP_SLICE);
 
-    OtaNowHeader h = { OTA_LORA_MAGIC, OTA_NOW_POLL,
-                       (uint16_t)(fo_session & 0xFFFF), 0 };
-    fo_ensurePeer(nd.mac);
-    fo_nowTx(nd.mac, &h, sizeof(h));
+    /* Ask more than once. A single lost slice used to lose the whole reply,
+     * and with several boards on the air that is common rather than rare. */
+    for (int attempt = 0; attempt < FO_POLL_ATTEMPTS && !fo_abort; attempt++) {
+        memset(nd.missing, 0, nd.missingBytes);
+        nd.bmpFresh = false;
+        nd.bmpSliceMask = 0;
 
-    uint32_t dl = millis() + OTA_POLL_TIMEOUT_MS;
-    while (millis() < dl && !nd.bmpFresh) vTaskDelay(2);
+        OtaNowHeader h = { OTA_LORA_MAGIC, OTA_NOW_POLL,
+                           (uint16_t)(fo_session & 0xFFFF), 0 };
+        fo_ensurePeer(nd.mac);
+        fo_nowTx(nd.mac, &h, sizeof(h));
+
+        uint32_t dl = millis() + OTA_POLL_TIMEOUT_MS;
+        while (millis() < dl && !nd.bmpFresh) vTaskDelay(2);
+        if (nd.bmpFresh) break;
+    }
     if (!nd.bmpFresh || !nd.missing) return false;
 
     uint32_t miss = 0;
@@ -613,7 +641,8 @@ static void fo_task(void *arg) {
     fo_sendAll();
 
     /* ---- repair rounds ---- */
-    for (fo_round = 1; fo_round <= 8 && !fo_abort; fo_round++) {
+    int silentRounds = 0;
+    for (fo_round = 1; fo_round <= FO_MAX_ROUNDS && !fo_abort; fo_round++) {
         fo_state = FO_REPAIR;
         memset(fo_need, 0, fo_needBytes);
 
@@ -634,11 +663,22 @@ static void fo_task(void *arg) {
             if (fo_need[i >> 3] & (1u << (i & 7))) miss++;
 
         if (miss == 0) {
-            /* Nobody answered the poll but somebody is still incomplete —
-             * usually a board that dropped off. Nothing to resend. */
-            fo_logf(SEV_WARN, "round %d: %d board(s) silent", fo_round, incomplete);
-            break;
+            /* Nobody answered this time, but somebody is still incomplete.
+             * Breaking here abandoned the whole session on a single unlucky
+             * round - which is exactly what happened with two boards at 99%,
+             * each a handful of blocks short. Try again; only give up once
+             * several rounds running have produced nothing at all. */
+            silentRounds++;
+            fo_logf(SEV_WARN, "round %d: %d board(s) silent (%d in a row)",
+                    fo_round, incomplete, silentRounds);
+            if (silentRounds >= FO_MAX_SILENT_ROUNDS) {
+                fo_log("boards stopped answering - giving up", SEV_ERR);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
+            continue;
         }
+        silentRounds = 0;
 
         fo_logf(SEV_INFO, "round %d: resending %lu block(s) for %d board(s)",
                 fo_round, (unsigned long)miss, incomplete);
