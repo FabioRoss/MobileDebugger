@@ -100,6 +100,43 @@ static uint32_t  fo_needBytes = 0;
 static const uint8_t fo_bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static bool     fo_loraUp = false;
 
+/* ---- ESP-NOW transmit backpressure -------------------------------------
+ * esp_now_send() is ASYNCHRONOUS. It queues the frame and returns; when the
+ * queue is full it returns ESP_ERR_ESPNOW_NO_MEM and the frame is dropped.
+ * Pacing with a fixed delay and ignoring the return value meant almost every
+ * block was discarded at the API before it ever reached the air - a 1723 KB
+ * image landed 14 of 7295 blocks. It looked like a range problem and was not.
+ *
+ * The send callback is the only honest signal that a frame has left, so keep
+ * a small window of in-flight frames and wait when it is full. */
+#define FO_TX_WINDOW 4
+
+static volatile uint32_t fo_txPending = 0;   /* queued, not yet reported sent */
+static volatile uint32_t fo_txDropped = 0;   /* refused by esp_now_send()     */
+static volatile uint32_t fo_txFailed  = 0;   /* sent, but reported failure    */
+
+static void fo_onSent(const uint8_t *mac, esp_now_send_status_t status) {
+    (void)mac;
+    if (fo_txPending) fo_txPending--;
+    if (status != ESP_NOW_SEND_SUCCESS) fo_txFailed++;
+}
+
+/* Queue one frame, blocking briefly while the window is full. Returns false
+ * only when the frame really was not accepted. */
+static bool fo_nowTx(const uint8_t *mac, const void *buf, size_t len) {
+    const uint32_t dl = millis() + 200;
+    while (fo_txPending >= FO_TX_WINDOW && millis() < dl) delayMicroseconds(150);
+
+    fo_txPending++;
+    esp_err_t e = esp_now_send(mac, (const uint8_t *)buf, len);
+    if (e != ESP_OK) {
+        if (fo_txPending) fo_txPending--;
+        fo_txDropped++;
+        return false;
+    }
+    return true;
+}
+
 /* ---- one-slot log mailbox (job task -> UI), same idiom as flasher.h ---- */
 volatile bool fo_mail_ready = false;
 char          fo_mail[110];
@@ -152,7 +189,9 @@ static void fo_ensurePeer(const uint8_t *mac) {
     if (esp_now_is_peer_exist(mac)) return;
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, mac, 6);
-    p.channel = FO_WIFI_CHAN;
+    /* 0 means "use the interface's current channel". Pinning a peer to a
+     * number that disagrees with the radio silently breaks delivery. */
+    p.channel = 0;
     p.encrypt = false;
     esp_now_add_peer(&p);
 }
@@ -218,11 +257,28 @@ static void fo_onRecvShim(const uint8_t *mac, const uint8_t *d, int len) {
 static bool fo_nowStart() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_set_channel(FO_WIFI_CHAN, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE);          /* power save wrecks ESP-NOW rx */
+    esp_wifi_set_max_tx_power(80);          /* 80 = 20 dBm, the ceiling     */
+
+    /* Set the channel and then READ IT BACK. esp_wifi_set_channel() fails
+     * silently if the driver is not started yet, and a flasher and a board on
+     * different channels only hear each other at a few centimetres - which
+     * looks exactly like a range problem. */
+    esp_err_t ce = esp_wifi_set_channel(FO_WIFI_CHAN, WIFI_SECOND_CHAN_NONE);
+    uint8_t got = 0; wifi_second_chan_t sec;
+    esp_wifi_get_channel(&got, &sec);
+    if (ce != ESP_OK || got != FO_WIFI_CHAN) {
+        fo_logf(SEV_ERR, "WiFi channel is %u, wanted %u (%s)",
+                got, FO_WIFI_CHAN, esp_err_to_name(ce));
+        return false;
+    }
+
     if (esp_now_init() != ESP_OK) return false;
     esp_now_register_recv_cb(fo_onRecvShim);
+    esp_now_register_send_cb(fo_onSent);    /* drives the backpressure window */
+    fo_txPending = fo_txDropped = fo_txFailed = 0;
     fo_ensurePeer(fo_bcast);
+    fo_logf(SEV_OK, "ESP-NOW up on channel %u, 20 dBm", got);
     return true;
 }
 
@@ -308,7 +364,7 @@ void fleet_abort_broadcast() {
     fo_loraSend(p, sizeof(p));
     OtaNowHeader h = { OTA_LORA_MAGIC, OTA_NOW_ABORT,
                        (uint16_t)(fo_session & 0xFFFF), 0 };
-    esp_now_send(fo_bcast, (const uint8_t *)&h, sizeof(h));
+    fo_nowTx(fo_bcast, &h, sizeof(h));
 }
 
 /* ======================================================================== */
@@ -415,11 +471,9 @@ static void fo_sendBlock(uint32_t idx) {
     memcpy(d.data, fo_image + off, n);
     if (n < OTA_BLOCK_DATA) memset(d.data + n, 0, OTA_BLOCK_DATA - n);
 
-    esp_now_send(fo_bcast, (const uint8_t *)&d, sizeof(OtaNowHeader) + n);
-    fo_sent++;
-    /* ESP-NOW has no flow control and the receivers are also driving a
-     * display, so pacing is the only backpressure available. */
-    delayMicroseconds(OTA_TX_GAP_US);
+    if (fo_nowTx(fo_bcast, &d, sizeof(OtaNowHeader) + n)) fo_sent++;
+    /* No fixed gap: fo_nowTx() blocks on the in-flight window instead, which
+     * paces to what the radio actually achieves rather than to a guess. */
 }
 
 /* One full pass over every block. */
@@ -432,6 +486,10 @@ static void fo_sendAll() {
         }
     }
     fo_pct = 100;
+    if (fo_txDropped || fo_txFailed)
+        fo_logf(SEV_WARN, "tx: %lu dropped, %lu failed of %lu",
+                (unsigned long)fo_txDropped, (unsigned long)fo_txFailed,
+                (unsigned long)fo_sent);
 }
 
 /* Ask one node what it is missing and merge the answer into fo_need. */
@@ -452,7 +510,7 @@ static bool fo_pollNode(int n) {
     OtaNowHeader h = { OTA_LORA_MAGIC, OTA_NOW_POLL,
                        (uint16_t)(fo_session & 0xFFFF), 0 };
     fo_ensurePeer(nd.mac);
-    esp_now_send(nd.mac, (const uint8_t *)&h, sizeof(h));
+    fo_nowTx(nd.mac, &h, sizeof(h));
 
     uint32_t dl = millis() + OTA_POLL_TIMEOUT_MS;
     while (millis() < dl && !nd.bmpFresh) vTaskDelay(2);
@@ -584,7 +642,7 @@ static void fo_task(void *arg) {
         OtaNowHeader c = { OTA_LORA_MAGIC, OTA_NOW_COMMIT,
                            (uint16_t)(fo_session & 0xFFFF), 0 };
         for (int i = 0; i < 3; i++) {
-            esp_now_send(fo_bcast, (const uint8_t *)&c, sizeof(c));
+            fo_nowTx(fo_bcast, &c, sizeof(c));
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
@@ -595,10 +653,15 @@ static void fo_task(void *arg) {
     end = millis() + 90000;
     while (millis() < end && !fo_abort) {
         fleet_lora_poll();
-        int ok = 0;
-        for (int i = 0; i < fo_node_count; i++)
-            if (fo_nodes[i].state == OTA_STATE_OK) ok++;
-        if (ok >= ready) break;
+        int ok = 0, failed = 0;
+        for (int i = 0; i < fo_node_count; i++) {
+            if (fo_nodes[i].state == OTA_STATE_OK)     ok++;
+            if (fo_nodes[i].state == OTA_STATE_FAILED) failed++;
+        }
+        /* Every board has reported one way or the other - no point waiting out
+         * the rest of the timeout. A FAILED board is sitting in the updater
+         * and will rejoin the next session. */
+        if (ok + failed >= ready) break;
         vTaskDelay(20);
     }
 
