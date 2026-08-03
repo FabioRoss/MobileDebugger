@@ -144,7 +144,11 @@ struct __attribute__((packed)) OtaNowStatus {
 
 enum : uint8_t {
     OTA_ERR_NONE      = 0,
-    OTA_ERR_NO_PSRAM  = 1,   /* staging buffer allocation failed             */
+    OTA_ERR_NO_PSRAM  = 1,   /* staging allocation failed - the PSRAM image  *
+                              * buffer, or the small DRAM block bitmap that  *
+                              * goes with it. The updater's serial log says   *
+                              * which; one code covers both so the wire       *
+                              * format does not grow for a diagnostic nicety. */
     OTA_ERR_TOO_BIG   = 2,   /* image exceeds the target partition           */
     OTA_ERR_SHA       = 3,   /* whole-image hash mismatch                    */
     OTA_ERR_FLASH     = 4,   /* esp_ota_write / esp_ota_end failed           */
